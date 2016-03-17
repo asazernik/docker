@@ -3,21 +3,41 @@
 package libcontainer
 
 import (
+	"io"
 	"os"
 	"syscall"
 
 	"github.com/opencontainers/runc/libcontainer/apparmor"
 	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/keys"
 	"github.com/opencontainers/runc/libcontainer/label"
+	"github.com/opencontainers/runc/libcontainer/seccomp"
 	"github.com/opencontainers/runc/libcontainer/system"
 )
 
 type linuxStandardInit struct {
+	pipe      io.ReadWriter
 	parentPid int
 	config    *initConfig
 }
 
+// PR_SET_NO_NEW_PRIVS isn't exposed in Golang so we define it ourselves copying the value
+// the kernel
+const PR_SET_NO_NEW_PRIVS = 0x26
+
 func (l *linuxStandardInit) Init() error {
+	// do not inherit the parent's session keyring
+	sessKeyId, err := keyctl.JoinSessionKeyring("")
+	if err != nil {
+		return err
+	}
+	// make session keyring searcheable
+	// without user ns we need 'UID' search permissions
+	// with user ns we need 'other' search permissions
+	if err := keyctl.ModKeyringPerm(sessKeyId, 0xffffffff, 0x080008); err != nil {
+		return err
+	}
+
 	// join any namespaces via a path to the namespace fd if provided
 	if err := joinExistingNamespaces(l.config.Config.Namespaces); err != nil {
 		return err
@@ -46,6 +66,9 @@ func (l *linuxStandardInit) Init() error {
 	if err := setupRlimits(l.config.Config); err != nil {
 		return err
 	}
+	if err := setOomScoreAdj(l.config.Config.OomScoreAdj); err != nil {
+		return err
+	}
 	label.Init()
 	// InitializeMountNamespace() can be executed only for a new mount namespace
 	if l.config.Config.Namespaces.Contains(configs.NEWNS) {
@@ -70,7 +93,6 @@ func (l *linuxStandardInit) Init() error {
 			return err
 		}
 	}
-
 	for _, path := range l.config.Config.ReadonlyPaths {
 		if err := remountReadonly(path); err != nil {
 			return err
@@ -84,6 +106,22 @@ func (l *linuxStandardInit) Init() error {
 	pdeath, err := system.GetParentDeathSignal()
 	if err != nil {
 		return err
+	}
+	if l.config.Config.NoNewPrivileges {
+		if err := system.Prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			return err
+		}
+	}
+	// Tell our parent that we're ready to Execv. This must be done before the
+	// Seccomp rules have been applied, because we need to be able to read and
+	// write to a socket.
+	if err := syncParentReady(l.pipe); err != nil {
+		return err
+	}
+	if l.config.Config.Seccomp != nil {
+		if err := seccomp.InitSeccomp(l.config.Config.Seccomp); err != nil {
+			return err
+		}
 	}
 	if err := finalizeNamespace(l.config); err != nil {
 		return err
@@ -99,8 +137,6 @@ func (l *linuxStandardInit) Init() error {
 	if syscall.Getppid() != l.parentPid {
 		return syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
 	}
-	if err := finalizeSeccomp(l.config); err != nil {
-		return err
-	}
+
 	return system.Execv(l.config.Args[0], l.config.Args[0:], os.Environ())
 }

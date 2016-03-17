@@ -5,6 +5,7 @@ package native
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,28 +21,35 @@ import (
 	"github.com/docker/docker/pkg/reexec"
 	sysinfo "github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/pkg/term"
+	aaprofile "github.com/docker/docker/profiles/apparmor"
 	"github.com/opencontainers/runc/libcontainer"
+	"github.com/opencontainers/runc/libcontainer/apparmor"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
+// Define constants for native driver
 const (
 	DriverName = "native"
 	Version    = "0.2"
+
+	defaultApparmorProfile = "docker-default"
 )
 
-type driver struct {
+// Driver contains all information for native driver,
+// it implements execdriver.Driver.
+type Driver struct {
 	root             string
-	initPath         string
 	activeContainers map[string]libcontainer.Container
 	machineMemory    int64
 	factory          libcontainer.Factory
 	sync.Mutex
 }
 
-func NewDriver(root, initPath string, options []string) (*driver, error) {
+// NewDriver returns a new native driver, called from NewDriver of execdriver.
+func NewDriver(root string, options []string) (*Driver, error) {
 	meminfo, err := sysinfo.ReadMemInfo()
 	if err != nil {
 		return nil, err
@@ -50,18 +58,25 @@ func NewDriver(root, initPath string, options []string) (*driver, error) {
 	if err := sysinfo.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
-	// native driver root is at docker_root/execdriver/native. Put apparmor at docker_root
-	if err := installApparmorProfile(); err != nil {
-		return nil, err
+
+	if apparmor.IsEnabled() {
+		if err := aaprofile.InstallDefault(defaultApparmorProfile); err != nil {
+			apparmorProfiles := []string{defaultApparmorProfile}
+
+			// Allow daemon to run if loading failed, but are active
+			// (possibly through another run, manually, or via system startup)
+			for _, policy := range apparmorProfiles {
+				if err := aaprofile.IsLoaded(policy); err != nil {
+					return nil, fmt.Errorf("AppArmor enabled on system but the %s profile could not be loaded.", policy)
+				}
+			}
+		}
 	}
 
 	// choose cgroup manager
 	// this makes sure there are no breaking changes to people
 	// who upgrade from versions without native.cgroupdriver opt
 	cgm := libcontainer.Cgroupfs
-	if systemd.UseSystemd() {
-		cgm = libcontainer.SystemdCgroups
-	}
 
 	// parse the options
 	for _, option := range options {
@@ -100,23 +115,27 @@ func NewDriver(root, initPath string, options []string) (*driver, error) {
 		return nil, err
 	}
 
-	return &driver{
+	return &Driver{
 		root:             root,
-		initPath:         initPath,
 		activeContainers: make(map[string]libcontainer.Container),
 		machineMemory:    meminfo.MemTotal,
 		factory:          f,
 	}, nil
 }
 
-type execOutput struct {
-	exitCode int
-	err      error
-}
+// Run implements the exec driver Driver interface,
+// it calls libcontainer APIs to run a container.
+func (d *Driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, hooks execdriver.Hooks) (execdriver.ExitStatus, error) {
+	destroyed := false
+	var err error
+	c.TmpDir, err = ioutil.TempDir("", c.ID)
+	if err != nil {
+		return execdriver.ExitStatus{ExitCode: -1}, err
+	}
+	defer os.RemoveAll(c.TmpDir)
 
-func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallback execdriver.StartCallback) (execdriver.ExitStatus, error) {
 	// take the Command and populate the libcontainer.Config from it
-	container, err := d.createContainer(c)
+	container, err := d.createContainer(c, hooks)
 	if err != nil {
 		return execdriver.ExitStatus{ExitCode: -1}, err
 	}
@@ -128,7 +147,9 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 		User: c.ProcessConfig.User,
 	}
 
-	if err := setupPipes(container, &c.ProcessConfig, p, pipes); err != nil {
+	wg := sync.WaitGroup{}
+	writers, err := setupPipes(container, &c.ProcessConfig, p, pipes, &wg)
+	if err != nil {
 		return execdriver.ExitStatus{ExitCode: -1}, err
 	}
 
@@ -136,29 +157,38 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 	if err != nil {
 		return execdriver.ExitStatus{ExitCode: -1}, err
 	}
-	d.Lock()
-	d.activeContainers[c.ID] = cont
-	d.Unlock()
-	defer func() {
-		cont.Destroy()
-		d.cleanContainer(c.ID)
-	}()
 
 	if err := cont.Start(p); err != nil {
 		return execdriver.ExitStatus{ExitCode: -1}, err
 	}
+	d.Lock()
+	d.activeContainers[c.ID] = cont
+	d.Unlock()
+	defer func() {
+		if !destroyed {
+			cont.Destroy()
+		}
+		d.cleanContainer(c.ID)
+	}()
 
-	if startCallback != nil {
+	//close the write end of any opened pipes now that they are dup'ed into the container
+	for _, writer := range writers {
+		writer.Close()
+	}
+	// 'oom' is used to emit 'oom' events to the eventstream, 'oomKilled' is used
+	// to set the 'OOMKilled' flag in state
+	oom := notifyOnOOM(cont)
+	oomKilled := notifyOnOOM(cont)
+	if hooks.Start != nil {
 		pid, err := p.Pid()
 		if err != nil {
 			p.Signal(os.Kill)
 			p.Wait()
 			return execdriver.ExitStatus{ExitCode: -1}, err
 		}
-		startCallback(&c.ProcessConfig, pid)
+		hooks.Start(&c.ProcessConfig, pid, oom)
 	}
 
-	oom := notifyOnOOM(cont)
 	waitF := p.Wait
 	if nss := cont.Config().Namespaces; !nss.Contains(configs.NEWPID) {
 		// we need such hack for tracking processes with inherited fds,
@@ -173,13 +203,31 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 		}
 		ps = execErr.ProcessState
 	}
+	// wait for all IO goroutine copiers to finish
+	wg.Wait()
+
 	cont.Destroy()
-	_, oomKill := <-oom
+	destroyed = true
+	// oomKilled will have an oom event if any process within the container was
+	// OOM killed at any time, not only if the init process OOMed.
+	//
+	// Perhaps we only want the OOMKilled flag to be set if the OOM
+	// resulted in a container death, but there isn't a good way to do this
+	// because the kernel's cgroup oom notification does not provide information
+	// such as the PID. This could be heuristically done by checking that the OOM
+	// happened within some very small time slice for the container dying (and
+	// optionally exit-code 137), but I don't think the cgroup oom notification
+	// can be used to reliably determine this
+	//
+	// Even if there were multiple OOMs, it's sufficient to read one value
+	// because libcontainer's oom notify will discard the channel after the
+	// cgroup is destroyed
+	_, oomKill := <-oomKilled
 	return execdriver.ExitStatus{ExitCode: utils.ExitStatus(ps.Sys().(syscall.WaitStatus)), OOMKilled: oomKill}, nil
 }
 
 // notifyOnOOM returns a channel that signals if the container received an OOM notification
-// for any process.  If it is unable to subscribe to OOM notifications then a closed
+// for any process. If it is unable to subscribe to OOM notifications then a closed
 // channel is returned as it will be non-blocking and return the correct result when read.
 func notifyOnOOM(container libcontainer.Container) <-chan struct{} {
 	oom, err := container.NotifyOOM()
@@ -242,7 +290,8 @@ func waitInPIDHost(p *libcontainer.Process, c libcontainer.Container) func() (*o
 	}
 }
 
-func (d *driver) Kill(c *execdriver.Command, sig int) error {
+// Kill implements the exec driver Driver interface.
+func (d *Driver) Kill(c *execdriver.Command, sig int) error {
 	d.Lock()
 	active := d.activeContainers[c.ID]
 	d.Unlock()
@@ -253,10 +302,15 @@ func (d *driver) Kill(c *execdriver.Command, sig int) error {
 	if err != nil {
 		return err
 	}
+	if state.InitProcessPid == -1 {
+		return fmt.Errorf("avoid sending signal %d to container %s with pid -1", sig, c.ID)
+	}
 	return syscall.Kill(state.InitProcessPid, syscall.Signal(sig))
 }
 
-func (d *driver) Pause(c *execdriver.Command) error {
+// Pause implements the exec driver Driver interface,
+// it calls libcontainer API to pause a container.
+func (d *Driver) Pause(c *execdriver.Command) error {
 	d.Lock()
 	active := d.activeContainers[c.ID]
 	d.Unlock()
@@ -266,7 +320,9 @@ func (d *driver) Pause(c *execdriver.Command) error {
 	return active.Pause()
 }
 
-func (d *driver) Unpause(c *execdriver.Command) error {
+// Unpause implements the exec driver Driver interface,
+// it calls libcontainer API to unpause a container.
+func (d *Driver) Unpause(c *execdriver.Command) error {
 	d.Lock()
 	active := d.activeContainers[c.ID]
 	d.Unlock()
@@ -276,7 +332,8 @@ func (d *driver) Unpause(c *execdriver.Command) error {
 	return active.Resume()
 }
 
-func (d *driver) Terminate(c *execdriver.Command) error {
+// Terminate implements the exec driver Driver interface.
+func (d *Driver) Terminate(c *execdriver.Command) error {
 	defer d.cleanContainer(c.ID)
 	container, err := d.factory.Load(c.ID)
 	if err != nil {
@@ -299,18 +356,13 @@ func (d *driver) Terminate(c *execdriver.Command) error {
 	return err
 }
 
-func (d *driver) Info(id string) execdriver.Info {
-	return &info{
-		ID:     id,
-		driver: d,
-	}
-}
-
-func (d *driver) Name() string {
+// Name implements the exec driver Driver interface.
+func (d *Driver) Name() string {
 	return fmt.Sprintf("%s-%s", DriverName, Version)
 }
 
-func (d *driver) GetPidsForContainer(id string) ([]int, error) {
+// GetPidsForContainer implements the exec driver Driver interface.
+func (d *Driver) GetPidsForContainer(id string) ([]int, error) {
 	d.Lock()
 	active := d.activeContainers[id]
 	d.Unlock()
@@ -321,22 +373,24 @@ func (d *driver) GetPidsForContainer(id string) ([]int, error) {
 	return active.Processes()
 }
 
-func (d *driver) cleanContainer(id string) error {
+func (d *Driver) cleanContainer(id string) error {
 	d.Lock()
 	delete(d.activeContainers, id)
 	d.Unlock()
 	return os.RemoveAll(filepath.Join(d.root, id))
 }
 
-func (d *driver) createContainerRoot(id string) error {
+func (d *Driver) createContainerRoot(id string) error {
 	return os.MkdirAll(filepath.Join(d.root, id), 0655)
 }
 
-func (d *driver) Clean(id string) error {
+// Clean implements the exec driver Driver interface.
+func (d *Driver) Clean(id string) error {
 	return os.RemoveAll(filepath.Join(d.root, id))
 }
 
-func (d *driver) Stats(id string) (*execdriver.ResourceStats, error) {
+// Stats implements the exec driver Driver interface.
+func (d *Driver) Stats(id string) (*execdriver.ResourceStats, error) {
 	d.Lock()
 	c := d.activeContainers[id]
 	d.Unlock()
@@ -348,7 +402,7 @@ func (d *driver) Stats(id string) (*execdriver.ResourceStats, error) {
 	if err != nil {
 		return nil, err
 	}
-	memoryLimit := c.Config().Cgroups.Memory
+	memoryLimit := c.Config().Cgroups.Resources.Memory
 	// if the container does not have any memory limit specified set the
 	// limit to the machines memory
 	if memoryLimit == 0 {
@@ -361,16 +415,38 @@ func (d *driver) Stats(id string) (*execdriver.ResourceStats, error) {
 	}, nil
 }
 
+// Update updates configs for a container
+func (d *Driver) Update(c *execdriver.Command) error {
+	d.Lock()
+	cont := d.activeContainers[c.ID]
+	d.Unlock()
+	if cont == nil {
+		return execdriver.ErrNotRunning
+	}
+	config := cont.Config()
+	if err := execdriver.SetupCgroups(&config, c); err != nil {
+		return err
+	}
+
+	if err := cont.Set(config); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TtyConsole implements the exec driver Terminal interface.
 type TtyConsole struct {
 	console libcontainer.Console
 }
 
-func NewTtyConsole(console libcontainer.Console, pipes *execdriver.Pipes, rootuid int) (*TtyConsole, error) {
+// NewTtyConsole returns a new TtyConsole struct.
+func NewTtyConsole(console libcontainer.Console, pipes *execdriver.Pipes, wg *sync.WaitGroup) (*TtyConsole, error) {
 	tty := &TtyConsole{
 		console: console,
 	}
 
-	if err := tty.AttachPipes(pipes); err != nil {
+	if err := tty.AttachPipes(pipes, wg); err != nil {
 		tty.Close()
 		return nil, err
 	}
@@ -378,16 +454,16 @@ func NewTtyConsole(console libcontainer.Console, pipes *execdriver.Pipes, rootui
 	return tty, nil
 }
 
-func (t *TtyConsole) Master() libcontainer.Console {
-	return t.console
-}
-
+// Resize implements Resize method of Terminal interface
 func (t *TtyConsole) Resize(h, w int) error {
 	return term.SetWinsize(t.console.Fd(), &term.Winsize{Height: uint16(h), Width: uint16(w)})
 }
 
-func (t *TtyConsole) AttachPipes(pipes *execdriver.Pipes) error {
+// AttachPipes attaches given pipes to TtyConsole
+func (t *TtyConsole) AttachPipes(pipes *execdriver.Pipes, wg *sync.WaitGroup) error {
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if wb, ok := pipes.Stdout.(interface {
 			CloseWriters() error
 		}); ok {
@@ -408,30 +484,46 @@ func (t *TtyConsole) AttachPipes(pipes *execdriver.Pipes) error {
 	return nil
 }
 
+// Close implements Close method of Terminal interface
 func (t *TtyConsole) Close() error {
 	return t.console.Close()
 }
 
-func setupPipes(container *configs.Config, processConfig *execdriver.ProcessConfig, p *libcontainer.Process, pipes *execdriver.Pipes) error {
-	var term execdriver.Terminal
-	var err error
+func setupPipes(container *configs.Config, processConfig *execdriver.ProcessConfig, p *libcontainer.Process, pipes *execdriver.Pipes, wg *sync.WaitGroup) ([]io.WriteCloser, error) {
+
+	writers := []io.WriteCloser{}
+
+	rootuid, err := container.HostUID()
+	if err != nil {
+		return writers, err
+	}
 
 	if processConfig.Tty {
-		rootuid, err := container.HostUID()
-		if err != nil {
-			return err
-		}
 		cons, err := p.NewConsole(rootuid)
 		if err != nil {
-			return err
+			return writers, err
 		}
-		term, err = NewTtyConsole(cons, pipes, rootuid)
-	} else {
+		term, err := NewTtyConsole(cons, pipes, wg)
+		if err != nil {
+			return writers, err
+		}
+		processConfig.Terminal = term
+		return writers, nil
+	}
+	// not a tty--set up stdio pipes
+	term := &execdriver.StdConsole{}
+	processConfig.Terminal = term
+
+	// if we are not in a user namespace, there is no reason to go through
+	// the hassle of setting up os-level pipes with proper (remapped) ownership
+	// so we will do the prior shortcut for non-userns containers
+	if rootuid == 0 {
 		p.Stdout = pipes.Stdout
 		p.Stderr = pipes.Stderr
+
 		r, w, err := os.Pipe()
 		if err != nil {
-			return err
+			return writers, err
 		}
 		if pipes.Stdin != nil {
 			go func() {
@@ -440,11 +532,75 @@ func setupPipes(container *configs.Config, processConfig *execdriver.ProcessConf
 			}()
 			p.Stdin = r
 		}
-		term = &execdriver.StdConsole{}
+		return writers, nil
 	}
+
+	// if we have user namespaces enabled (rootuid != 0), we will set
+	// up os pipes for stderr, stdout, stdin so we can chown them to
+	// the proper ownership to allow for proper access to the underlying
+	// fds
+	var fds []uintptr
+
+	copyPipes := func(out io.Writer, in io.ReadCloser) {
+		defer wg.Done()
+		io.Copy(out, in)
+		in.Close()
+	}
+
+	//setup stdout
+	r, w, err := os.Pipe()
 	if err != nil {
-		return err
+		w.Close()
+		return writers, err
 	}
-	processConfig.Terminal = term
-	return nil
+	writers = append(writers, w)
+	fds = append(fds, r.Fd(), w.Fd())
+	if pipes.Stdout != nil {
+		wg.Add(1)
+		go copyPipes(pipes.Stdout, r)
+	}
+	term.Closers = append(term.Closers, r)
+	p.Stdout = w
+
+	//setup stderr
+	r, w, err = os.Pipe()
+	if err != nil {
+		w.Close()
+		return writers, err
+	}
+	writers = append(writers, w)
+	fds = append(fds, r.Fd(), w.Fd())
+	if pipes.Stderr != nil {
+		wg.Add(1)
+		go copyPipes(pipes.Stderr, r)
+	}
+	term.Closers = append(term.Closers, r)
+	p.Stderr = w
+
+	//setup stdin
+	r, w, err = os.Pipe()
+	if err != nil {
+		r.Close()
+		return writers, err
+	}
+	fds = append(fds, r.Fd(), w.Fd())
+	if pipes.Stdin != nil {
+		go func() {
+			io.Copy(w, pipes.Stdin)
+			w.Close()
+		}()
+		p.Stdin = r
+	}
+	for _, fd := range fds {
+		if err := syscall.Fchown(int(fd), rootuid, rootuid); err != nil {
+			return writers, fmt.Errorf("Failed to chown pipes fd: %v", err)
+		}
+	}
+	return writers, nil
+}
+
+// SupportsHooks implements the execdriver Driver interface.
+// The libcontainer/runC-based native execdriver does exploit the hook mechanism
+func (d *Driver) SupportsHooks() bool {
+	return true
 }

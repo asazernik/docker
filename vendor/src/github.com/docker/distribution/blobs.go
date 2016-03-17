@@ -9,6 +9,7 @@ import (
 
 	"github.com/docker/distribution/context"
 	"github.com/docker/distribution/digest"
+	"github.com/docker/distribution/reference"
 )
 
 var (
@@ -40,6 +41,18 @@ func (err ErrBlobInvalidDigest) Error() string {
 		err.Digest, err.Reason)
 }
 
+// ErrBlobMounted returned when a blob is mounted from another repository
+// instead of initiating an upload session.
+type ErrBlobMounted struct {
+	From       reference.Canonical
+	Descriptor Descriptor
+}
+
+func (err ErrBlobMounted) Error() string {
+	return fmt.Sprintf("blob mounted from: %v to: %v",
+		err.From, err.Descriptor)
+}
+
 // Descriptor describes targeted content. Used in conjunction with a blob
 // store, a descriptor can be used to fetch, store and target any kind of
 // blob. The struct also describes the wire protocol format. Fields should
@@ -49,8 +62,8 @@ type Descriptor struct {
 	// encoded as utf-8.
 	MediaType string `json:"mediaType,omitempty"`
 
-	// Length in bytes of content.
-	Length int64 `json:"length,omitempty"`
+	// Size in bytes of content.
+	Size int64 `json:"size,omitempty"`
 
 	// Digest uniquely identifies the content. A byte stream can be verified
 	// against against this digest.
@@ -61,6 +74,15 @@ type Descriptor struct {
 	// depend on the simplicity of this type.
 }
 
+// Descriptor returns the descriptor, to make it satisfy the Describable
+// interface. Note that implementations of Describable are generally objects
+// which can be described, not simply descriptors; this exception is in place
+// to make it more convenient to pass actual descriptors to functions that
+// expect Describable objects.
+func (d Descriptor) Descriptor() Descriptor {
+	return d
+}
+
 // BlobStatter makes blob descriptors available by digest. The service may
 // provide a descriptor of a different digest if the provided digest is not
 // canonical.
@@ -68,6 +90,16 @@ type BlobStatter interface {
 	// Stat provides metadata about a blob identified by the digest. If the
 	// blob is unknown to the describer, ErrBlobUnknown will be returned.
 	Stat(ctx context.Context, dgst digest.Digest) (Descriptor, error)
+}
+
+// BlobDeleter enables deleting blobs from storage.
+type BlobDeleter interface {
+	Delete(ctx context.Context, dgst digest.Digest) error
+}
+
+// BlobEnumerator enables iterating over blobs from storage
+type BlobEnumerator interface {
+	Enumerate(ctx context.Context, ingester func(dgst digest.Digest) error) error
 }
 
 // BlobDescriptorService manages metadata about a blob by digest. Most
@@ -87,6 +119,9 @@ type BlobDescriptorService interface {
 	// the restriction that the algorithm of the descriptor must match the
 	// canonical algorithm (ie sha256) of the annotator.
 	SetDescriptor(ctx context.Context, dgst digest.Digest, desc Descriptor) error
+
+	// Clear enables descriptors to be unlinked
+	Clear(ctx context.Context, dgst digest.Digest) error
 }
 
 // ReadSeekCloser is the primary reader type for blob data, combining
@@ -134,10 +169,19 @@ type BlobIngester interface {
 	// returned handle can be written to and later resumed using an opaque
 	// identifier. With this approach, one can Close and Resume a BlobWriter
 	// multiple times until the BlobWriter is committed or cancelled.
-	Create(ctx context.Context) (BlobWriter, error)
+	Create(ctx context.Context, options ...BlobCreateOption) (BlobWriter, error)
 
 	// Resume attempts to resume a write to a blob, identified by an id.
 	Resume(ctx context.Context, id string) (BlobWriter, error)
+}
+
+// BlobCreateOption is a general extensible function argument for blob creation
+// methods. A BlobIngester may choose to honor any or none of the given
+// BlobCreateOptions, which can be specific to the implementation of the
+// BlobIngester receiving them.
+// TODO (brianbland): unify this with ManifestServiceOption in the future
+type BlobCreateOption interface {
+	Apply(interface{}) error
 }
 
 // BlobWriter provides a handle for inserting data into a blob store.
@@ -172,6 +216,9 @@ type BlobWriter interface {
 	// result in a no-op. This allows use of Cancel in a defer statement,
 	// increasing the assurance that it is correctly called.
 	Cancel(ctx context.Context) error
+
+	// Get a reader to the blob being written by this BlobWriter
+	Reader() (io.ReadCloser, error)
 }
 
 // BlobService combines the operations to access, read and write blobs. This
@@ -183,8 +230,9 @@ type BlobService interface {
 }
 
 // BlobStore represent the entire suite of blob related operations. Such an
-// implementation can access, read, write and serve blobs.
+// implementation can access, read, write, delete and serve blobs.
 type BlobStore interface {
 	BlobService
 	BlobServer
+	BlobDeleter
 }
